@@ -1,0 +1,201 @@
+use anyhow::{anyhow, Result};
+use chrono::Utc;
+use futures::stream::StreamExt;
+use serde::Deserialize;
+use tokio_tungstenite::tungstenite::Message;
+use tracing::{info, warn};
+
+use crate::db::{OptionTickRow, OptionTickSender};
+use crate::settings::AppConfig;
+use crate::stats::{ConnState, SharedStats};
+
+/// Helper: deserialize a null/absent numeric field as `None` rather than
+/// erroring. NSE option ticks legitimately send null for illiquid strikes.
+fn null_as_none_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<f64>::deserialize(deserializer)
+}
+
+fn null_as_none_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer)
+}
+
+/// Individual option leg (CE or PE). All numeric fields are optional because
+/// NSE sends null for strikes with no trading activity.
+#[derive(Debug, Deserialize, Clone, Default)]
+struct OptionLeg {
+    #[serde(rename = "totalTradedVolume", default, deserialize_with = "null_as_none_u64")]
+    total_traded_volume: Option<u64>,
+    #[serde(rename = "lastPrice", default, deserialize_with = "null_as_none_f64")]
+    last_price: Option<f64>,
+    #[serde(default, deserialize_with = "null_as_none_f64")]
+    change: Option<f64>,
+    #[serde(rename = "openInterest", default, deserialize_with = "null_as_none_f64")]
+    open_interest: Option<f64>,
+    #[serde(rename = "buyPrice1", default, deserialize_with = "null_as_none_f64")]
+    buy_price1: Option<f64>,
+    #[serde(rename = "sellPrice1", default, deserialize_with = "null_as_none_f64")]
+    sell_price1: Option<f64>,
+}
+
+/// Complete option chain tick message from NSE's `fo/mbp` WSS.
+#[derive(Debug, Deserialize, Clone)]
+struct OptionChainMessage {
+    #[serde(rename = "expiryDates")]
+    expiry_dates: String,
+    #[serde(rename = "strikePrice")]
+    strike_price: f64,
+    #[serde(rename = "PE", default)]
+    pe: Option<OptionLeg>,
+    #[serde(rename = "CE", default)]
+    ce: Option<OptionLeg>,
+}
+
+/// Run a single symbol/expiry's option streamer with automatic reconnect.
+/// `stream_key` uniquely identifies this connection for the dashboard, e.g.
+/// "options:NIFTY:30-Jun-2026".
+pub async fn run(
+    config: AppConfig,
+    symbol: String,
+    expiry: String,
+    tx: OptionTickSender,
+    stats: SharedStats,
+) {
+    let stream_key = format!("options:{}:{}", symbol, expiry);
+
+    {
+        let mut s = stats.write().await;
+        s.ensure_stream(&stream_key);
+    }
+
+    loop {
+        {
+            let mut s = stats.write().await;
+            let stat = s.ensure_stream(&stream_key);
+            stat.state = ConnState::Connecting;
+        }
+
+        match stream_once(&config, &symbol, &expiry, &tx, &stats, &stream_key).await {
+            Ok(_) => {
+                info!("Options stream [{}] closed gracefully", stream_key);
+            }
+            Err(e) => {
+                warn!("Options stream [{}] error: {}", stream_key, e);
+                let mut s = stats.write().await;
+                let stat = s.ensure_stream(&stream_key);
+                stat.last_error = Some(e.to_string());
+                stat.reconnect_count += 1;
+                stat.state = ConnState::Reconnecting;
+            }
+        }
+
+        if tx.is_closed() {
+            let mut s = stats.write().await;
+            let stat = s.ensure_stream(&stream_key);
+            stat.state = ConnState::Stopped;
+            break;
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            config.runtime.reconnect_delay_seconds,
+        ))
+        .await;
+    }
+}
+
+/// Build the option_ticks WSS URL: base + ?symbol=<symbol>&expiry=<expiry>
+fn build_ws_url(config: &AppConfig, symbol: &str, expiry: &str) -> String {
+    format!(
+        "{}?symbol={}&expiry={}",
+        config.system.option_ticks.base,
+        urlencoding::encode(symbol),
+        urlencoding::encode(expiry),
+    )
+}
+
+async fn stream_once(
+    config: &AppConfig,
+    symbol: &str,
+    expiry: &str,
+    tx: &OptionTickSender,
+    stats: &SharedStats,
+    stream_key: &str,
+) -> Result<()> {
+    let url = build_ws_url(config, symbol, expiry);
+    info!("Connecting options stream [{}] -> {}", stream_key, url);
+
+    let (mut ws_stream, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .map_err(|e| anyhow!("WebSocket connection failed for {}: {}", stream_key, e))?;
+
+    {
+        let mut s = stats.write().await;
+        let stat = s.ensure_stream(stream_key);
+        stat.state = ConnState::Connected;
+    }
+
+    while let Some(msg_result) = ws_stream.next().await {
+        match msg_result {
+            Ok(Message::Text(text)) => {
+                let parsed: OptionChainMessage = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("[{}] JSON parse error: {}", stream_key, e);
+                        continue;
+                    }
+                };
+
+                let ce = parsed.ce.unwrap_or_default();
+                let pe = parsed.pe.unwrap_or_default();
+
+                let row = OptionTickRow {
+                    time: Utc::now(),
+                    symbol: symbol.to_string(),
+                    expiry: parsed.expiry_dates,
+                    strike_price: parsed.strike_price,
+
+                    ce_last_price: ce.last_price,
+                    ce_change: ce.change,
+                    ce_volume: ce.total_traded_volume.map(|v| v as i64),
+                    ce_oi: ce.open_interest,
+                    ce_bid: ce.buy_price1,
+                    ce_ask: ce.sell_price1,
+
+                    pe_last_price: pe.last_price,
+                    pe_change: pe.change,
+                    pe_volume: pe.total_traded_volume.map(|v| v as i64),
+                    pe_oi: pe.open_interest,
+                    pe_bid: pe.buy_price1,
+                    pe_ask: pe.sell_price1,
+                };
+
+                {
+                    let mut s = stats.write().await;
+                    let stat = s.ensure_stream(stream_key);
+                    stat.ticks_received += 1;
+                    stat.last_tick_at = Some(chrono::Local::now());
+                }
+
+                if tx.send(row).await.is_err() {
+                    info!("DB writer channel closed; stopping options stream [{}].", stream_key);
+                    break;
+                }
+            }
+            Ok(Message::Close(_)) => {
+                info!("Options WebSocket [{}] closed by server", stream_key);
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(anyhow!("Options WebSocket error [{}]: {}", stream_key, e));
+            }
+        }
+    }
+
+    Ok(())
+}
