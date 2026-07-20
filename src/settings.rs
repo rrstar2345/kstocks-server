@@ -63,9 +63,7 @@ pub struct SystemConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DatabaseConfig {
-    /// QuestDB connection string via its Postgres-wire-compatible endpoint
-    /// (default port 8812, not Postgres's 5432), e.g.
-    /// postgres://admin:quest@localhost:8812/qdb
+    /// Path to the SQLite database file, e.g. `<db_dir>/kstocks.db`.
     pub connection_string: String,
     pub max_connections: u32,
     /// Max ticks to buffer in memory before a forced flush.
@@ -93,7 +91,8 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    pub fn default() -> Self {
+    pub fn default(paths: &AppPaths) -> Self {
+        let db_path = paths.db_dir.join("kstocks.db");
         AppConfig {
             system: SystemConfig {
                 indices_streamer: ApiEndpoint {
@@ -114,7 +113,7 @@ impl AppConfig {
                 },
             },
             database: DatabaseConfig {
-                connection_string: "postgres://admin:quest@localhost:8812/qdb".to_string(),
+                connection_string: db_path.to_string_lossy().to_string(),
                 max_connections: 5,
                 batch_max_rows: 500,
                 batch_max_wait_ms: 500,
@@ -128,7 +127,8 @@ impl AppConfig {
     }
 }
 
-pub fn load_or_create_config(settings_file: &PathBuf) -> io::Result<AppConfig> {
+pub fn load_or_create_config(paths: &AppPaths) -> io::Result<AppConfig> {
+    let settings_file = &paths.settings_file;
     if settings_file.exists() {
         match fs::read_to_string(settings_file) {
             Ok(content) => match serde_json::from_str::<AppConfig>(&content) {
@@ -146,7 +146,7 @@ pub fn load_or_create_config(settings_file: &PathBuf) -> io::Result<AppConfig> {
         }
     }
 
-    let default_config = AppConfig::default();
+    let default_config = AppConfig::default(paths);
     let config_json = serde_json::to_string_pretty(&default_config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 

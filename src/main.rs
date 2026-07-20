@@ -14,7 +14,7 @@ use settings::{load_or_create_config, setup_app_folders};
 use stats::new_shared_stats;
 
 #[derive(Parser, Debug)]
-#[command(name = "kstocks-server", about = "NSE market data collector: WSS -> QuestDB")]
+#[command(name = "kstocks-server", about = "NSE market data collector: WSS -> SQLite")]
 struct Cli {
     /// Disable the interactive terminal dashboard (useful when run as a
     /// scheduled/headless task, e.g. via systemd or cron).
@@ -44,19 +44,18 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting kstocks-server, logs at {}", log_path.display());
 
-    let config = load_or_create_config(&paths.settings_file)?;
+    let config = load_or_create_config(&paths)?;
 
     let pool = match db::init_pool(&config.database).await {
         Ok(p) => p,
         Err(e) => {
             error!("Failed to initialize database: {}", e);
-            eprintln!("Failed to connect to QuestDB: {e}");
+            eprintln!("Failed to connect to SQLite database: {e}");
             eprintln!("Check `database.connection_string` in {}", paths.settings_file.display());
-            eprintln!("Make sure QuestDB is running and reachable on its Postgres-wire port (default 8812).");
             return Err(e);
         }
     };
-    info!("QuestDB connected and schema verified");
+    info!("SQLite connected and schema verified");
 
     let stats = new_shared_stats();
 

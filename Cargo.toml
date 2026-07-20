@@ -1,7 +1,7 @@
 [package]
 name = "kstocks_server"
 version = "0.1.0"
-description = "Standalone CLI backend: fetches NSE index/option WSS ticks and stores them"
+description = "Standalone CLI backend: fetches NSE index/option WSS ticks and stores them in SQLite"
 edition = "2024"
 
 [[bin]]
@@ -15,7 +15,7 @@ dirs = "6.0.0"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-tungstenite = { version = "0.29.0", features = ["native-tls"] }
 anyhow = "1.0.103"
-sqlx = { version = "0.9.0", features = ["postgres", "runtime-tokio", "macros", "chrono"] }
+sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio", "macros", "chrono"] }
 futures = "0.3.32"
 chrono = { version = "0.4.45", features = ["serde"] }
 lazy_static = "1.5.0"
