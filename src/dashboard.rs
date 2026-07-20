@@ -43,6 +43,7 @@ async fn event_loop(
                 s.streams.values().cloned().collect::<Vec<_>>(),
                 s.indices_db.clone(),
                 s.options_db.clone(),
+                s.session_mode_label.clone(),
             )
         };
 
@@ -65,10 +66,11 @@ type Snapshot = (
     Vec<crate::stats::StreamStat>,
     crate::stats::DbStat,
     crate::stats::DbStat,
+    String,
 );
 
 fn draw(f: &mut ratatui::Frame, snapshot: Snapshot) {
-    let (started_at, mut streams, indices_db, options_db) = snapshot;
+    let (started_at, mut streams, indices_db, options_db, session_mode_label) = snapshot;
     streams.sort_by(|a, b| a.name.cmp(&b.name));
 
     let area = f.area();
@@ -82,13 +84,18 @@ fn draw(f: &mut ratatui::Frame, snapshot: Snapshot) {
         ])
         .split(area);
 
-    draw_header(f, chunks[0], started_at);
+    draw_header(f, chunks[0], started_at, &session_mode_label);
     draw_streams_table(f, chunks[1], &streams);
     draw_db_panel(f, chunks[2], &indices_db, &options_db);
     draw_footer(f, chunks[3]);
 }
 
-fn draw_header(f: &mut ratatui::Frame, area: Rect, started_at: Option<chrono::DateTime<chrono::Local>>) {
+fn draw_header(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    started_at: Option<chrono::DateTime<chrono::Local>>,
+    session_mode_label: &str,
+) {
     let uptime = started_at
         .map(|s| {
             let dur = chrono::Local::now().signed_duration_since(s);
@@ -101,10 +108,14 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, started_at: Option<chrono::Da
         })
         .unwrap_or_else(|| "--:--:--".to_string());
 
+    let mode_color = if session_mode_label == "ACTIVE" { Color::Green } else { Color::Blue };
+
     let text = Line::from(vec![
         Span::styled(" kstocks-server ", Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
         Span::raw(" | market data collector | uptime "),
         Span::styled(uptime, Style::default().fg(Color::Yellow)),
+        Span::raw(" | session "),
+        Span::styled(session_mode_label.to_string(), Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
     ]);
 
     let block = Block::default().borders(Borders::ALL).title(" Control Panel ");
@@ -129,6 +140,7 @@ fn draw_streams_table(f: &mut ratatui::Frame, area: Rect, streams: &[crate::stat
                 ConnState::Connected => Style::default().fg(Color::Green),
                 ConnState::Connecting => Style::default().fg(Color::Yellow),
                 ConnState::Reconnecting => Style::default().fg(Color::Red),
+                ConnState::Idle => Style::default().fg(Color::Blue),
                 ConnState::Stopped => Style::default().fg(Color::DarkGray),
             };
             let last_tick = s
@@ -149,7 +161,7 @@ fn draw_streams_table(f: &mut ratatui::Frame, area: Rect, streams: &[crate::stat
         .collect();
 
     let widths = [
-        Constraint::Length(28),
+        Constraint::Length(40),
         Constraint::Length(13),
         Constraint::Length(10),
         Constraint::Length(10),

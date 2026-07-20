@@ -3,9 +3,10 @@ use chrono::Utc;
 use futures::stream::StreamExt;
 use serde::Deserialize;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::db::{OptionTickRow, OptionTickSender};
+use crate::market_clock::{SessionMode, SharedSessionState};
 use crate::settings::AppConfig;
 use crate::stats::{ConnState, SharedStats};
 
@@ -56,15 +57,16 @@ struct OptionChainMessage {
     ce: Option<OptionLeg>,
 }
 
-/// Run a single symbol/expiry's option streamer with automatic reconnect.
-/// `stream_key` uniquely identifies this connection for the dashboard, e.g.
-/// "options:NIFTY:30-Jun-2026".
+/// Run a single symbol/expiry's option streamer with automatic reconnect,
+/// alternating between Active (held-open connection) and Idle (hourly poll)
+/// modes based on `session`.
 pub async fn run(
     config: AppConfig,
     symbol: String,
     expiry: String,
     tx: OptionTickSender,
     stats: SharedStats,
+    session: SharedSessionState,
 ) {
     let stream_key = format!("options:{}:{}", symbol, expiry);
 
@@ -74,37 +76,66 @@ pub async fn run(
     }
 
     loop {
-        {
-            let mut s = stats.write().await;
-            let stat = s.ensure_stream(&stream_key);
-            stat.state = ConnState::Connecting;
-        }
+        let mode = session.mode().await;
 
-        match stream_once(&config, &symbol, &expiry, &tx, &stats, &stream_key).await {
-            Ok(_) => {
-                info!("Options stream [{}] closed gracefully", stream_key);
+        match mode {
+            SessionMode::Active => {
+                {
+                    let mut s = stats.write().await;
+                    let stat = s.ensure_stream(&stream_key);
+                    stat.state = ConnState::Connecting;
+                }
+
+                match stream_active(&config, &symbol, &expiry, &tx, &stats, &stream_key, &session).await {
+                    Ok(_) => info!("Options stream [{}] closed gracefully", stream_key),
+                    Err(e) => {
+                        warn!("Options stream [{}] error: {}", stream_key, e);
+                        let mut s = stats.write().await;
+                        let stat = s.ensure_stream(&stream_key);
+                        stat.last_error = Some(e.to_string());
+                        stat.reconnect_count += 1;
+                        stat.state = ConnState::Reconnecting;
+                    }
+                }
+
+                if tx.is_closed() {
+                    let mut s = stats.write().await;
+                    let stat = s.ensure_stream(&stream_key);
+                    stat.state = ConnState::Stopped;
+                    break;
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_secs(
+                    config.runtime.reconnect_delay_seconds,
+                ))
+                .await;
             }
-            Err(e) => {
-                warn!("Options stream [{}] error: {}", stream_key, e);
-                let mut s = stats.write().await;
-                let stat = s.ensure_stream(&stream_key);
-                stat.last_error = Some(e.to_string());
-                stat.reconnect_count += 1;
-                stat.state = ConnState::Reconnecting;
+            SessionMode::Idle => {
+                {
+                    let mut s = stats.write().await;
+                    let stat = s.ensure_stream(&stream_key);
+                    stat.state = ConnState::Idle;
+                }
+
+                if let Err(e) =
+                    poll_once(&config, &symbol, &expiry, &tx, &stats, &stream_key, &session).await
+                {
+                    debug!("Options idle poll [{}] error (expected outside market hours): {}", stream_key, e);
+                }
+
+                if tx.is_closed() {
+                    let mut s = stats.write().await;
+                    let stat = s.ensure_stream(&stream_key);
+                    stat.state = ConnState::Stopped;
+                    break;
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_secs(
+                    config.runtime.idle_poll_interval_secs,
+                ))
+                .await;
             }
         }
-
-        if tx.is_closed() {
-            let mut s = stats.write().await;
-            let stat = s.ensure_stream(&stream_key);
-            stat.state = ConnState::Stopped;
-            break;
-        }
-
-        tokio::time::sleep(tokio::time::Duration::from_secs(
-            config.runtime.reconnect_delay_seconds,
-        ))
-        .await;
     }
 }
 
@@ -118,18 +149,80 @@ fn build_ws_url(config: &AppConfig, symbol: &str, expiry: &str) -> String {
     )
 }
 
-async fn stream_once(
+/// Parse and forward one message. Option ticks have no documented
+/// heartbeat/idle-marker convention (unlike the indices stream), so every
+/// successfully parsed message counts as real activity.
+async fn handle_message(
+    text: &str,
+    symbol: &str,
+    tx: &OptionTickSender,
+    stats: &SharedStats,
+    stream_key: &str,
+    session: &SharedSessionState,
+) -> Result<()> {
+    let parsed: OptionChainMessage = match serde_json::from_str(text) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("[{}] JSON parse error: {}", stream_key, e);
+            return Ok(());
+        }
+    };
+
+    let ce = parsed.ce.unwrap_or_default();
+    let pe = parsed.pe.unwrap_or_default();
+
+    let row = OptionTickRow {
+        time: Utc::now(),
+        symbol: symbol.to_string(),
+        expiry: parsed.expiry_dates,
+        strike_price: parsed.strike_price,
+
+        ce_last_price: ce.last_price,
+        ce_change: ce.change,
+        ce_volume: ce.total_traded_volume.map(|v| v as i64),
+        ce_oi: ce.open_interest,
+        ce_bid: ce.buy_price1,
+        ce_ask: ce.sell_price1,
+
+        pe_last_price: pe.last_price,
+        pe_change: pe.change,
+        pe_volume: pe.total_traded_volume.map(|v| v as i64),
+        pe_oi: pe.open_interest,
+        pe_bid: pe.buy_price1,
+        pe_ask: pe.sell_price1,
+    };
+
+    {
+        let mut s = stats.write().await;
+        let stat = s.ensure_stream(stream_key);
+        stat.ticks_received += 1;
+        stat.last_tick_at = Some(chrono::Local::now());
+    }
+
+    session.record_activity().await;
+
+    if tx.send(row).await.is_err() {
+        return Err(anyhow!("DB writer channel closed"));
+    }
+
+    Ok(())
+}
+
+/// Active mode: hold the WSS connection open and process messages as they
+/// arrive, checking after each one whether we should drop back to Idle.
+async fn stream_active(
     config: &AppConfig,
     symbol: &str,
     expiry: &str,
     tx: &OptionTickSender,
     stats: &SharedStats,
     stream_key: &str,
+    session: &SharedSessionState,
 ) -> Result<()> {
     let url = build_ws_url(config, symbol, expiry);
-    info!("Connecting options stream [{}] -> {}", stream_key, url);
+    info!("Connecting options stream [{}] -> {} (active mode)", stream_key, url);
 
-    let (mut ws_stream, _) = tokio_tungstenite::connect_async(&url)
+    let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
         .await
         .map_err(|e| anyhow!("WebSocket connection failed for {}: {}", stream_key, e))?;
 
@@ -139,52 +232,25 @@ async fn stream_once(
         stat.state = ConnState::Connected;
     }
 
-    while let Some(msg_result) = ws_stream.next().await {
+    let (_, mut read) = ws_stream.split();
+
+    loop {
+        if session.mode().await == SessionMode::Idle {
+            info!("Switching options stream [{}] to idle mode; closing active connection.", stream_key);
+            return Ok(());
+        }
+
+        let next = tokio::time::timeout(tokio::time::Duration::from_secs(30), read.next()).await;
+
+        let msg_result = match next {
+            Ok(Some(r)) => r,
+            Ok(None) => break,
+            Err(_) => continue, // timeout; loop back to re-check mode
+        };
+
         match msg_result {
             Ok(Message::Text(text)) => {
-                let parsed: OptionChainMessage = match serde_json::from_str(&text) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        warn!("[{}] JSON parse error: {}", stream_key, e);
-                        continue;
-                    }
-                };
-
-                let ce = parsed.ce.unwrap_or_default();
-                let pe = parsed.pe.unwrap_or_default();
-
-                let row = OptionTickRow {
-                    time: Utc::now(),
-                    symbol: symbol.to_string(),
-                    expiry: parsed.expiry_dates,
-                    strike_price: parsed.strike_price,
-
-                    ce_last_price: ce.last_price,
-                    ce_change: ce.change,
-                    ce_volume: ce.total_traded_volume.map(|v| v as i64),
-                    ce_oi: ce.open_interest,
-                    ce_bid: ce.buy_price1,
-                    ce_ask: ce.sell_price1,
-
-                    pe_last_price: pe.last_price,
-                    pe_change: pe.change,
-                    pe_volume: pe.total_traded_volume.map(|v| v as i64),
-                    pe_oi: pe.open_interest,
-                    pe_bid: pe.buy_price1,
-                    pe_ask: pe.sell_price1,
-                };
-
-                {
-                    let mut s = stats.write().await;
-                    let stat = s.ensure_stream(stream_key);
-                    stat.ticks_received += 1;
-                    stat.last_tick_at = Some(chrono::Local::now());
-                }
-
-                if tx.send(row).await.is_err() {
-                    info!("DB writer channel closed; stopping options stream [{}].", stream_key);
-                    break;
-                }
+                handle_message(&text, symbol, tx, stats, stream_key, session).await?;
             }
             Ok(Message::Close(_)) => {
                 info!("Options WebSocket [{}] closed by server", stream_key);
@@ -194,6 +260,57 @@ async fn stream_once(
             Err(e) => {
                 return Err(anyhow!("Options WebSocket error [{}]: {}", stream_key, e));
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// Idle mode: briefly connect, listen for up to `idle_poll_listen_secs`, and
+/// disconnect. Any message seen flips the shared session to Active via
+/// `record_activity`, so the next loop iteration switches to the held-open
+/// connection.
+async fn poll_once(
+    config: &AppConfig,
+    symbol: &str,
+    expiry: &str,
+    tx: &OptionTickSender,
+    stats: &SharedStats,
+    stream_key: &str,
+    session: &SharedSessionState,
+) -> Result<()> {
+    let url = build_ws_url(config, symbol, expiry);
+
+    let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .map_err(|e| anyhow!("WebSocket connection failed for {} (idle poll): {}", stream_key, e))?;
+
+    debug!("Options idle poll [{}]: connected, listening briefly", stream_key);
+
+    let (_, mut read) = ws_stream.split();
+    let listen_for = tokio::time::Duration::from_secs(config.runtime.idle_poll_listen_secs);
+    let deadline = tokio::time::Instant::now() + listen_for;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        match tokio::time::timeout(remaining, read.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                handle_message(&text, symbol, tx, stats, stream_key, session).await?;
+                if session.mode().await == SessionMode::Active {
+                    break;
+                }
+            }
+            Ok(Some(Ok(Message::Close(_)))) => break,
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(e))) => {
+                return Err(anyhow!("Options WebSocket error [{}] during idle poll: {}", stream_key, e))
+            }
+            Ok(None) => break,
+            Err(_) => break, // overall listen window elapsed
         }
     }
 

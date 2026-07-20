@@ -9,6 +9,7 @@ pub enum ConnState {
     Connecting,
     Connected,
     Reconnecting,
+    Idle,
     Stopped,
 }
 
@@ -18,6 +19,7 @@ impl ConnState {
             ConnState::Connecting => "CONNECTING",
             ConnState::Connected => "CONNECTED",
             ConnState::Reconnecting => "RECONNECTING",
+            ConnState::Idle => "IDLE (polling)",
             ConnState::Stopped => "STOPPED",
         }
     }
@@ -61,6 +63,7 @@ pub struct AppStats {
     pub indices_db: DbStat,
     pub options_db: DbStat,
     pub started_at: Option<DateTime<Local>>,
+    pub session_mode_label: String,
 }
 
 pub type SharedStats = Arc<RwLock<AppStats>>;

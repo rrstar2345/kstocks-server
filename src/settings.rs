@@ -59,6 +59,8 @@ pub struct SystemConfig {
     pub indices_info: ApiEndpoint,
     /// https://www.nseindia.com/api/option-chain-contract-info?symbol=<fnoIndexName>
     pub option_info: ApiEndpoint,
+    /// https://www.nseindia.com/api/NextApi/dynamicApi?functionName=getCurrentTime
+    pub current_time: ApiEndpoint,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -81,6 +83,15 @@ pub struct RuntimeConfig {
     pub reconnect_delay_seconds: u64,
     /// If true, restrict streaming to the NSE trading window (9:00-15:30 IST, Mon-Fri).
     pub restrict_to_trading_window: bool,
+    /// Seconds of no real (non-heartbeat) tick activity within the trading
+    /// window before switching from Active to Idle mode. Default 3600 (1 hour).
+    pub inactive_switch_after_secs: i64,
+    /// Seconds between polls while in Idle mode (outside trading hours, or
+    /// quiet for too long inside it). Default 3600 (1 hour).
+    pub idle_poll_interval_secs: u64,
+    /// How long (seconds) to hold each Idle-mode poll connection open,
+    /// listening for any message, before disconnecting again.
+    pub idle_poll_listen_secs: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -111,6 +122,10 @@ impl AppConfig {
                     base: "https://www.nseindia.com/api/option-chain-contract-info".to_string(),
                     desc: "Fetch the expiry dates and strike prices for the index".to_string(),
                 },
+                current_time: ApiEndpoint {
+                    base: "https://www.nseindia.com/api/NextApi/dynamicApi?functionName=getCurrentTime".to_string(),
+                    desc: "Get NSE's current IST server time".to_string(),
+                },
             },
             database: DatabaseConfig {
                 connection_string: db_path.to_string_lossy().to_string(),
@@ -122,6 +137,9 @@ impl AppConfig {
                 symbol_refresh_interval_seconds: 3600,
                 reconnect_delay_seconds: 5,
                 restrict_to_trading_window: false,
+                inactive_switch_after_secs: 3600,
+                idle_poll_interval_secs: 3600,
+                idle_poll_listen_secs: 15,
             },
         }
     }

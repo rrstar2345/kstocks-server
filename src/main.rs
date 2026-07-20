@@ -1,6 +1,7 @@
 mod dashboard;
 mod db;
 mod http;
+mod market_clock;
 mod settings;
 mod stats;
 mod streamers;
@@ -10,6 +11,7 @@ use clap::Parser;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+use market_clock::new_shared_session_state;
 use settings::{load_or_create_config, setup_app_folders};
 use stats::new_shared_stats;
 
@@ -59,6 +61,34 @@ async fn main() -> anyhow::Result<()> {
 
     let stats = new_shared_stats();
 
+    // Market-hours session state, driven by NSE's own IST clock so this
+    // works correctly regardless of the server's own timezone/region.
+    let session = new_shared_session_state();
+    market_clock::refresh_if_stale(&config).await;
+    {
+        let mut s = stats.write().await;
+        s.session_mode_label = session.mode().await.label().to_string();
+    }
+
+    // Background supervisor: periodically re-syncs the NSE time offset and
+    // re-evaluates Active/Idle mode (trading window + inactivity timeout).
+    let supervisor_config = config.clone();
+    let supervisor_stats = stats.clone();
+    let supervisor_session = session.clone();
+    let supervisor_handle = tokio::spawn(async move {
+        loop {
+            market_clock::refresh_if_stale(&supervisor_config).await;
+            let mode = supervisor_session
+                .tick(supervisor_config.runtime.inactive_switch_after_secs)
+                .await;
+            {
+                let mut s = supervisor_stats.write().await;
+                s.session_mode_label = mode.label().to_string();
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+        }
+    });
+
     // Batched writers (one per tick type), each backed by an mpsc channel so
     // streamers never block on the DB.
     let (index_tx, index_writer_handle) =
@@ -78,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
         config.clone(),
         index_tx.clone(),
         stats.clone(),
+        session.clone(),
     ));
 
     // Up to 5 option streamers (one per resolved F&O symbol).
@@ -89,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
             se.expiry,
             option_tx.clone(),
             stats.clone(),
+            session.clone(),
         ));
         option_handles.push(handle);
     }
@@ -112,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
     for h in option_handles {
         h.abort();
     }
+    supervisor_handle.abort();
     let _ = index_writer_handle.await;
     let _ = option_writer_handle.await;
 
