@@ -153,7 +153,129 @@ async fn create_schema(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
-    info!("SQLite schema verified: index_ticks and option_ticks");
+    // ------------------------------------------------------------------
+    // Aggregated OHLC tables
+    // ------------------------------------------------------------------
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS index_ohlc_1m (
+            index_name TEXT NOT NULL,
+            bucket_start TEXT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            tick_count INTEGER NOT NULL,
+            PRIMARY KEY (index_name, bucket_start)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_index_ohlc_1m_bucket
+        ON index_ohlc_1m(bucket_start);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS index_ohlc_1d (
+            index_name TEXT NOT NULL,
+            bucket_start TEXT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            tick_count INTEGER NOT NULL,
+            PRIMARY KEY (index_name, bucket_start)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_index_ohlc_1d_bucket
+        ON index_ohlc_1d(bucket_start);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // `expiry_date` is stored as a real ISO date (YYYY-MM-DD) column,
+    // separate from the free-form `expiry` string on option_ticks, so the
+    // purge routine can do a cheap textual/date comparison against "today"
+    // without parsing on every run.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS option_ohlc_1m (
+            symbol TEXT NOT NULL,
+            expiry TEXT NOT NULL,
+            expiry_date DATE NOT NULL,
+            strike_price REAL NOT NULL,
+            bucket_start TEXT NOT NULL,
+
+            ce_open REAL,
+            ce_high REAL,
+            ce_low REAL,
+            ce_close REAL,
+            ce_volume INTEGER,
+            ce_oi_close REAL,
+
+            pe_open REAL,
+            pe_high REAL,
+            pe_low REAL,
+            pe_close REAL,
+            pe_volume INTEGER,
+            pe_oi_close REAL,
+
+            tick_count INTEGER NOT NULL,
+            PRIMARY KEY (symbol, expiry, strike_price, bucket_start)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_option_ohlc_1m_bucket
+        ON option_ohlc_1m(bucket_start);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_option_ohlc_1m_expiry_date
+        ON option_ohlc_1m(expiry_date);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Watermark table: tracks how far each aggregation tier has scanned so
+    // reruns only look at newly-arrived data.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS aggregation_state (
+            table_name TEXT PRIMARY KEY,
+            last_bucket_end TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    info!("SQLite schema verified: index_ticks, option_ticks, OHLC tiers, aggregation_state");
 
     Ok(())
 }

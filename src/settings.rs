@@ -95,10 +95,65 @@ pub struct RuntimeConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AggregationConfig {
+    /// How often (seconds) the 1-minute OHLC aggregation job runs.
+    pub run_interval_secs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RetentionConfig {
+    /// Raw index_ticks/option_ticks older than this many trading days are
+    /// purged (once *_ohlc_1m coverage is confirmed).
+    pub raw_ticks_keep_trading_days: i64,
+    /// index_ohlc_1m rows older than this many days are purged (once
+    /// index_ohlc_1d coverage is confirmed).
+    pub index_ohlc_1m_keep_days: i64,
+    /// option_ohlc_1m rows are purged once `expiry_date < today - this many days`.
+    pub option_ohlc_1m_expiry_grace_days: i64,
+    /// index_ohlc_1d rows older than this many days are purged. 0 = keep forever.
+    pub index_ohlc_1d_keep_days: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ApiConfig {
+    /// Port for the read-only HTTP OHLC API.
+    pub port: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppConfig {
     pub system: SystemConfig,
     pub database: DatabaseConfig,
     pub runtime: RuntimeConfig,
+    #[serde(default = "AggregationConfig::default_config")]
+    pub aggregation: AggregationConfig,
+    #[serde(default = "RetentionConfig::default_config")]
+    pub retention: RetentionConfig,
+    #[serde(default = "ApiConfig::default_config")]
+    pub api: ApiConfig,
+}
+
+impl AggregationConfig {
+    fn default_config() -> Self {
+        Self { run_interval_secs: 300 }
+    }
+}
+
+impl RetentionConfig {
+    fn default_config() -> Self {
+        Self {
+            raw_ticks_keep_trading_days: 2,
+            index_ohlc_1m_keep_days: 60,
+            option_ohlc_1m_expiry_grace_days: 7,
+            index_ohlc_1d_keep_days: 365 * 3,
+        }
+    }
+}
+
+impl ApiConfig {
+    fn default_config() -> Self {
+        Self { port: 8787 }
+    }
 }
 
 impl AppConfig {
@@ -141,6 +196,9 @@ impl AppConfig {
                 idle_poll_interval_secs: 3600,
                 idle_poll_listen_secs: 15,
             },
+            aggregation: AggregationConfig::default_config(),
+            retention: RetentionConfig::default_config(),
+            api: ApiConfig::default_config(),
         }
     }
 }

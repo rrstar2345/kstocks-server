@@ -1,7 +1,10 @@
+mod aggregation;
+mod api;
 mod dashboard;
 mod db;
 mod http;
 mod market_clock;
+mod retention;
 mod settings;
 mod stats;
 mod streamers;
@@ -125,6 +128,18 @@ async fn main() -> anyhow::Result<()> {
         option_handles.push(handle);
     }
 
+    // Aggregation: 1-minute OHLC bars every `run_interval_secs`, plus a
+    // once-daily 1m -> 1d rollup after market close.
+    let agg_1m_handle = aggregation::spawn_1m_aggregation_loop(pool.clone(), config.aggregation.run_interval_secs);
+    let agg_rollup_handle = aggregation::spawn_daily_rollup_loop(pool.clone());
+
+    // Retention: once-daily purge (raw ticks + 1m tiers + expired options),
+    // weekly VACUUM.
+    let retention_handle = retention::spawn_retention_loop(pool.clone(), config.retention.clone());
+
+    // Read-only HTTP OHLC API, on its own SqlitePool.
+    let api_handle = api::spawn_api_server(config.clone(), stats.clone(), session.clone());
+
     if cli.no_dashboard {
         info!("Running headless (--no-dashboard). Ctrl-C to stop.");
         tokio::signal::ctrl_c().await?;
@@ -145,6 +160,10 @@ async fn main() -> anyhow::Result<()> {
         h.abort();
     }
     supervisor_handle.abort();
+    agg_1m_handle.abort();
+    agg_rollup_handle.abort();
+    retention_handle.abort();
+    api_handle.abort();
     let _ = index_writer_handle.await;
     let _ = option_writer_handle.await;
 
