@@ -162,7 +162,7 @@ fn draw_streams_table(f: &mut ratatui::Frame, area: Rect, streams: &[crate::stat
 
     let widths = [
         Constraint::Length(40),
-        Constraint::Length(13),
+        Constraint::Length(20),
         Constraint::Length(10),
         Constraint::Length(10),
         Constraint::Length(11),

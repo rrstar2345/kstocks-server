@@ -44,6 +44,11 @@ struct OptionLeg {
     sell_price1: Option<f64>,
 }
 
+/// NSE sends `flag: "HEARTBEAT"` (all fields otherwise null/zeroed) on this
+/// stream during off hours to keep the socket alive. These aren't real
+/// ticks and must not count as activity or reset the idle timer.
+const HEARTBEAT_FLAG: &str = "HEARTBEAT";
+
 /// Complete option chain tick message from NSE's `fo/mbp` WSS.
 #[derive(Debug, Deserialize, Clone)]
 struct OptionChainMessage {
@@ -51,10 +56,12 @@ struct OptionChainMessage {
     expiry_dates: String,
     #[serde(rename = "strikePrice")]
     strike_price: f64,
-    #[serde(rename = "PE", default)]
+    #[serde(rename = "PE", alias = "pe", default)]
     pe: Option<OptionLeg>,
-    #[serde(rename = "CE", default)]
+    #[serde(rename = "CE", alias = "ce", default)]
     ce: Option<OptionLeg>,
+    #[serde(default)]
+    flag: Option<String>,
 }
 
 /// Run a single symbol/expiry's option streamer with automatic reconnect,
@@ -149,9 +156,8 @@ fn build_ws_url(config: &AppConfig, symbol: &str, expiry: &str) -> String {
     )
 }
 
-/// Parse and forward one message. Option ticks have no documented
-/// heartbeat/idle-marker convention (unlike the indices stream), so every
-/// successfully parsed message counts as real activity.
+/// Parse and (if not a heartbeat) forward one message. Returns `true` if the
+/// message represented real activity (i.e. was not a heartbeat).
 async fn handle_message(
     text: &str,
     symbol: &str,
@@ -159,14 +165,19 @@ async fn handle_message(
     stats: &SharedStats,
     stream_key: &str,
     session: &SharedSessionState,
-) -> Result<()> {
+) -> Result<bool> {
     let parsed: OptionChainMessage = match serde_json::from_str(text) {
         Ok(m) => m,
         Err(e) => {
             warn!("[{}] JSON parse error: {}", stream_key, e);
-            return Ok(());
+            return Ok(false);
         }
     };
+
+    if parsed.flag.as_deref() == Some(HEARTBEAT_FLAG) {
+        // Off-hours keep-alive; not real activity.
+        return Ok(false);
+    }
 
     let ce = parsed.ce.unwrap_or_default();
     let pe = parsed.pe.unwrap_or_default();
@@ -205,7 +216,7 @@ async fn handle_message(
         return Err(anyhow!("DB writer channel closed"));
     }
 
-    Ok(())
+    Ok(true)
 }
 
 /// Active mode: hold the WSS connection open and process messages as they
