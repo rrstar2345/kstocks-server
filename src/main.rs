@@ -1,22 +1,21 @@
-mod aggregation;
 mod api;
-mod dashboard;
-mod db;
-mod http;
-mod market_clock;
-mod retention;
+mod market;
 mod settings;
 mod stats;
-mod streamers;
-mod symbols;
+mod storage;
+mod utils;
 
 use clap::Parser;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use market_clock::new_shared_session_state;
+use market::market_clock;
+use market::market_clock::new_shared_session_state;
+use market::{streamers, symbols};
 use settings::{load_or_create_config, setup_app_folders};
 use stats::new_shared_stats;
+use storage::{ohlc as aggregation, retention};
+use utils::dashboard;
 
 #[derive(Parser, Debug)]
 #[command(name = "kstocks-server", about = "NSE market data collector: WSS -> SQLite")]
@@ -51,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = load_or_create_config(&paths)?;
 
-    let pool = match db::init_pool(&config.database).await {
+    let pool = match storage::init_pool(&config.database).await {
         Ok(p) => p,
         Err(e) => {
             error!("Failed to initialize database: {}", e);
@@ -95,9 +94,9 @@ async fn main() -> anyhow::Result<()> {
     // Batched writers (one per tick type), each backed by an mpsc channel so
     // streamers never block on the DB.
     let (index_tx, index_writer_handle) =
-        db::start_index_tick_writer(pool.clone(), config.database.clone(), stats.clone());
+        storage::start_index_tick_writer(pool.clone(), config.database.clone(), stats.clone());
     let (option_tx, option_writer_handle) =
-        db::start_option_tick_writer(pool.clone(), config.database.clone(), stats.clone());
+        storage::start_option_tick_writer(pool.clone(), config.database.clone(), stats.clone());
 
     // Resolve the 5 F&O symbols + nearest expiry dynamically from NSE.
     info!("Resolving F&O symbols and nearest expiries...");

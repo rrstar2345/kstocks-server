@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use crate::http;
+use crate::market::http;
 use crate::settings::AppConfig;
 
 #[derive(Debug, Deserialize)]

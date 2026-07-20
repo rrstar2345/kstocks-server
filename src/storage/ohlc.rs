@@ -487,7 +487,7 @@ pub fn spawn_daily_rollup_loop(pool: SqlitePool) -> tokio::task::JoinHandle<()> 
 
 /// Seconds from now until the next occurrence of `hour:minute` IST.
 fn seconds_until_next_run(hour: u32, minute: u32) -> u64 {
-    let now = crate::market_clock::get_ist_now();
+    let now = crate::market::market_clock::get_ist_now();
     let ist_offset = Duration::seconds(5 * 3600 + 30 * 60);
     let ist_now = now + ist_offset;
 

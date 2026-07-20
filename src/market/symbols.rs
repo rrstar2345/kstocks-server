@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::{info, warn};
 
-use crate::http;
+use crate::market::http;
 use crate::settings::AppConfig;
 
 /// One entry from `getAllIndices`.
