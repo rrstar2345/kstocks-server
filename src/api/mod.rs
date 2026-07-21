@@ -8,9 +8,14 @@
 //! file) with a busy_timeout pragma, so slow reads never contend with the
 //! ingest writer under WAL mode.
 
+mod admin;
+mod auth_middleware;
+mod client_auth;
 mod health;
 mod index_ohlc;
 mod option_ohlc;
+mod register;
+mod validate;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
@@ -18,6 +23,7 @@ use axum::routing::get;
 use axum::Router;
 use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -30,6 +36,10 @@ pub(crate) struct ApiState {
     #[allow(dead_code)]
     pub(crate) stats: SharedStats,
     pub(crate) session: SharedSessionState,
+    /// Separate `kstocks-users.db` pool: client registrations, approval
+    /// status, and the admin token hash. Kept apart from `pool` (market
+    /// data) so the two subsystems never contend or share a failure mode.
+    pub(crate) users_pool: SqlitePool,
 }
 
 /// Open a dedicated read pool for the API. Same DB file as the ingest
@@ -51,6 +61,7 @@ pub fn spawn_api_server(
     config: AppConfig,
     stats: SharedStats,
     session: SharedSessionState,
+    users_pool: SqlitePool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let pool = match init_api_pool(&config.database).await {
@@ -61,12 +72,29 @@ pub fn spawn_api_server(
             }
         };
 
-        let state = Arc::new(ApiState { pool, stats, session });
+        let state = Arc::new(ApiState { pool, stats, session, users_pool });
 
-        let app = Router::new()
+        // `/ohlc/*` requires an approved client key.
+        let ohlc_routes = Router::new()
             .route("/ohlc/index", get(index_ohlc::get_index_ohlc))
             .route("/ohlc/option", get(option_ohlc::get_option_ohlc))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware::require_approved_client,
+            ));
+
+        // `/admin/*` requires the separate admin token.
+        let admin_routes = admin::admin_router().route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admin::require_admin_token,
+        ));
+
+        let app = Router::new()
+            .merge(ohlc_routes)
+            .merge(admin_routes)
             .route("/health", get(health::get_health))
+            .route("/register", axum::routing::post(register::post_register))
+            .route("/validate", get(validate::get_validate))
             .with_state(state);
 
         let addr = format!("0.0.0.0:{}", config.api.port);
@@ -80,7 +108,12 @@ pub fn spawn_api_server(
             }
         };
 
-        if let Err(e) = axum::serve(listener, app).await {
+        // `into_make_service_with_connect_info` is required for the
+        // `ConnectInfo<SocketAddr>` extractor used by `/register`'s
+        // rate limiting.
+        if let Err(e) =
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
+        {
             error!("API server error: {}", e);
         }
     })

@@ -3,7 +3,7 @@
 Standalone Rust backend that connects to NSE's WebSocket streams for index
 and F&O option data, persists raw ticks to SQLite, aggregates them into
 OHLC bars, purges old data on a retention schedule, and serves the
-aggregated bars over a read-only HTTP API.
+aggregated bars over a read-only, per-client-authenticated HTTP API.
 
 ## What it does
 
@@ -17,7 +17,12 @@ aggregated bars over a read-only HTTP API.
    safely aggregated and outside their retention window; runs a weekly
    `VACUUM`.
 4. **Serve** — Exposes the aggregated OHLC bars (never raw ticks, never
-   the in-progress candle) over a small read-only HTTP API.
+   the in-progress candle) over a small read-only HTTP API, gated behind
+   per-client API keys.
+5. **Authenticate** — Clients self-register, an admin reviews and
+   approves/declines/revokes them, and every subsequent request (OHLC
+   data or a launch-time validation check) is checked against that
+   approval state.
 
 ## Architecture
 
@@ -130,7 +135,7 @@ Key architectural points:
 
 ```
 src/
-  main.rs              entry point: wiring, task spawning, shutdown
+  main.rs              entry point: wiring, task spawning, shutdown, `admin` CLI subcommand
   settings.rs           config structs + load/save of settings_server.json
   stats.rs               shared in-memory stats (dashboard + health endpoint)
   market/               everything related to fetching NSE data
@@ -144,11 +149,20 @@ src/
     ticks.rs              schema, batched tick writers
     ohlc.rs                1m/1d OHLC aggregation (watermark-driven)
     retention.rs           purge + vacuum routines
-  api/                  read-only HTTP API
+  users/                client registration/auth, in its own kstocks-users.db
+    mod.rs                 pool init, schema, client/admin-token queries
+    keys.rs                client key + admin token generation/hashing
+    admin_cli.rs           `kstocks-server admin generate|regenerate` logic
+  api/                  read-only HTTP API + auth
     mod.rs                 router, shared state, range/interval helpers
-    index_ohlc.rs          GET /ohlc/index
-    option_ohlc.rs          GET /ohlc/option
+    index_ohlc.rs          GET /ohlc/index          (client key required)
+    option_ohlc.rs          GET /ohlc/option          (client key required)
     health.rs               GET /health
+    register.rs             POST /register
+    validate.rs             GET /validate            (client key required)
+    client_auth.rs          shared client-key parsing/lookup logic
+    auth_middleware.rs      middleware enforcing client key on /ohlc/*
+    admin.rs                GET/POST /admin/*        (admin token required)
   utils/
     dashboard.rs           terminal dashboard (ratatui)
 ```
@@ -168,6 +182,25 @@ On first run, a default config is written to
 current directory if no data-local-dir is available). Edit that file to
 change ports, retention windows, aggregation cadence, etc. — see
 [Configuration](#configuration) below.
+
+### Admin token setup
+
+`/admin/*` routes (reviewing and approving/declining/revoking clients)
+require a bearer token that can **only** be minted from the machine the
+server runs on — there is no HTTP endpoint that creates or rotates it.
+This is a one-shot CLI mode; it does not start the server or streamers.
+
+```
+kstocks-server admin generate      # first-time setup; fails if a token already exists
+kstocks-server admin regenerate    # rotate — invalidates the previous token immediately
+```
+
+Each prints the plaintext token to stdout **once**. Store it securely
+(e.g. a password manager or secrets file with restricted permissions) —
+it cannot be recovered later, only rotated. The running server checks
+incoming `/admin/*` requests against the hash stored in
+`kstocks-users.db`, so no restart is needed after `regenerate` — the very
+next admin request is validated against the new token.
 
 ## Configuration
 
@@ -237,11 +270,29 @@ since it briefly locks the whole database file.
   outage — not distinguished) simply has no row. No nulls, no
   fill-forward.
 
+### Users database (`kstocks-users.db`)
+
+Client registration and auth state live in a **separate** SQLite file
+from market data, so the two never share a writer, a backup policy, or a
+failure mode.
+
+- `clients` — one row per registered username: `key_id`, `secret_hash`
+  (never the plaintext secret), `status` (`pending` / `approved` /
+  `declined` / `revoked`), `registered_ip`, timestamps. A `revoked` row is
+  never deleted (so future telemetry keyed on the numeric `id` isn't
+  orphaned) and is instead overwritten in place if that username
+  registers again.
+- `admin_token` — single row holding the current admin token's hash. Only
+  ever written by the `admin generate`/`admin regenerate` CLI subcommand
+  (see [Admin token setup](#admin-token-setup)), never by any HTTP route.
+
 ## HTTP API
 
-Read-only. Runs on its own SQLite connection pool (separate from the
-ingest writers, same database file) with a `busy_timeout`, so slow reads
-never contend with the ingest writer under WAL mode.
+Read-only for market data. Runs on its own SQLite connection pool
+(separate from the ingest writers, same database file) with a
+`busy_timeout`, so slow reads never contend with the ingest writer under
+WAL mode. Client and admin auth state is read from the separate
+`kstocks-users.db` (see [Users database](#users-database-kstocks-usersdb)).
 
 The API only ever serves **completed, already-aggregated** bars from the
 OHLC tables. It never reads raw ticks and never represents the
@@ -251,9 +302,76 @@ push/streaming endpoint.
 
 Base URL: `http://<host>:<api.port>` (default port `8787`).
 
+### Authentication model
+
+Every client (e.g. each install of the desktop app) has a single API key
+of the form:
+
+```
+<username>-<key_id>-<secret>
+```
+
+e.g. `johndoe-adc214s3-2jfh79gs`. Sent on every authenticated request as:
+
+```
+Authorization: Bearer <username>-<key_id>-<secret>
+```
+
+**Lifecycle:**
+
+1. Client calls `POST /register` once, choosing a username. The server
+   generates the key pair server-side and returns the **full plaintext
+   key in that single response** — the client must persist it locally
+   (e.g. OS keychain or a local config file) and never display it to the
+   user. The server only ever stores a hash of the secret half, never the
+   plaintext.
+2. The registration starts in `pending` status. It is **not yet usable**
+   against `/ohlc/*` — the key exists but is dormant until an admin
+   approves it via `/admin/*`.
+3. On every app launch (and periodically thereafter, if desired), the
+   client calls `GET /validate` with its stored key to check current
+   status before showing its main screen.
+4. An admin can `decline` a pending request, or `revoke` an already
+   `approved` one at any time — both immediately block `/ohlc/*` and
+   `/validate` on the next request, no client-side action needed.
+
+**Endpoint auth summary:**
+
+| Endpoint | Auth required |
+|---|---|
+| `POST /register` | None (rate-limited instead — see below) |
+| `GET /validate` | Client key (any status — returns the status itself) |
+| `GET /ohlc/index`, `GET /ohlc/option` | Client key, **must be `approved`** |
+| `GET /health` | None |
+| `/admin/*` | Admin token (see [Admin token setup](#admin-token-setup)) |
+
+A client key that is `pending`, `declined`, or `revoked` is rejected from
+`/ohlc/*` with the same `401 Unauthorized` as a malformed or unknown key
+— the response never reveals *why* a key doesn't work there, to avoid
+leaking which usernames/key_ids exist. `/validate` is the one place a
+non-approved client learns its actual status, by design, so the desktop
+app can show a meaningful "pending approval" / "access revoked" message.
+
+**Registration rate limiting**, to bound abuse of the open `/register`
+endpoint:
+- One registration attempt per IP per rolling 24h window is the target
+  behavior in most cases, but the actual enforced rules are:
+  - A username with an existing `pending`, `approved`, or `declined` row
+    cannot register again (`400 Bad Request`) — only a `revoked` username
+    may re-register, which overwrites its row with a fresh key pair.
+  - An IP that has produced 5 or more registrations (any username) in the
+    last 24h is throttled (`429 Too Many Requests`), regardless of
+    username status.
+- Dormant `pending` keys carry no access on their own (see auth summary
+  above), so this limiter's job is bounding review-queue noise and DB
+  growth, not preventing unauthorized data access.
+
 ---
 
 ### `GET /ohlc/index`
+
+Requires `Authorization: Bearer <client key>` with `status: approved`
+(see [Authentication model](#authentication-model)).
 
 Index OHLC bars, sourced from `index_ohlc_1m` or `index_ohlc_1d`
 depending on the requested interval.
@@ -323,6 +441,9 @@ GET /ohlc/index?name=NIFTY%2050&range=1d&interval=5m
 ---
 
 ### `GET /ohlc/option`
+
+Requires `Authorization: Bearer <client key>` with `status: approved`
+(see [Authentication model](#authentication-model)).
 
 Option OHLC bars (wide CE/PE shape), always sourced from
 `option_ohlc_1m`.
@@ -421,6 +542,150 @@ No query parameters. Returns current ingest/aggregation status.
 
 ---
 
+### `POST /register`
+
+No authentication required (see [rate limiting](#authentication-model)
+above). Called once by a new client install.
+
+**Request body**
+
+```json
+{ "username": "johndoe" }
+```
+
+`username` is sanitized server-side to lowercase alphanumeric characters
+only; anything else (spaces, symbols, punctuation) is stripped. If
+nothing alphanumeric remains, the request is rejected.
+
+**Example response** (`200 OK`)
+
+```json
+{
+  "status": "pending",
+  "api_key": "johndoe-adc214s3-2jfh79gs"
+}
+```
+
+`api_key` is shown **exactly once** — store it immediately (e.g. OS
+keychain or local config), never re-derivable from the server afterward.
+`status` is always `"pending"` on a fresh registration; the key carries
+no `/ohlc/*` access until an admin approves it.
+
+**Error responses**
+
+```json
+{ "error": "username must contain at least one alphanumeric character" }
+```
+
+```json
+{ "error": "username already has a registration in 'approved' status" }
+```
+`400 Bad Request` — returned for any existing `pending`, `approved`, or
+`declined` registration under that username. Only a `revoked` username
+may register again.
+
+```json
+{ "error": "too many registration attempts from this network today" }
+```
+`429 Too Many Requests` — 5+ registrations from the same IP in the last
+24h, regardless of username.
+
+---
+
+### `GET /validate`
+
+Requires `Authorization: Bearer <client key>`. Intended to be called on
+every app launch (and optionally on a periodic interval) to decide
+whether to show the main screen or a "pending"/"revoked" message.
+
+**Example response** — approved
+
+```json
+{ "approved": true, "status": "approved" }
+```
+
+**Example response** — not yet approved / declined / revoked
+
+```json
+{ "approved": false, "status": "pending" }
+```
+
+**Error response** — malformed, unknown, or mismatched key
+
+```json
+{ "error": "invalid or unknown key" }
+```
+`401 Unauthorized`.
+
+---
+
+### `/admin/*`
+
+All admin routes require `Authorization: Bearer <admin token>`, where the
+token is generated by the `kstocks-server admin generate` /
+`admin regenerate` CLI subcommand (see
+[Admin token setup](#admin-token-setup)) — there is no HTTP-level way to
+create or rotate this token. Missing/invalid token → `401 Unauthorized`
+on every route below.
+
+#### `GET /admin/registrations`
+
+Lists every client, any status, most recently created first.
+
+```json
+[
+  {
+    "id": 4,
+    "username": "johndoe",
+    "key_id": "adc214s3",
+    "status": "pending",
+    "registered_ip": "203.0.113.7",
+    "created_at": "2026-07-21T05:12:03+00:00",
+    "updated_at": "2026-07-21T05:12:03+00:00"
+  }
+]
+```
+
+Note `key_id` is shown (safe — it's a public lookup value, not the
+secret), but the secret/secret hash never appears in any admin response.
+
+#### `POST /admin/registrations/{id}/approve`
+
+Moves a `pending` client to `approved`, immediately unlocking `/ohlc/*`
+and `/validate` for that client's existing key — no new key is issued.
+
+```json
+{ "id": 4, "status": "approved" }
+```
+
+#### `POST /admin/registrations/{id}/decline`
+
+Moves a `pending` client to `declined`. The key remains dormant
+permanently unless the username is later revoked and re-registers.
+
+```json
+{ "id": 4, "status": "declined" }
+```
+
+#### `POST /admin/clients/{id}/revoke`
+
+Moves any client (typically `approved`) to `revoked`. Takes effect
+immediately — the next `/ohlc/*` or `/validate` call with that key fails.
+The row itself is kept (not deleted), so future telemetry tied to `id`
+isn't orphaned.
+
+```json
+{ "id": 4, "status": "revoked" }
+```
+
+All three action endpoints return `404 Not Found` for an unknown `id`:
+
+```json
+{ "error": "no such client" }
+```
+
+---
+
 ## Notes for API consumers
 
 - All timestamps are RFC 3339 / ISO 8601 in UTC.
@@ -432,3 +697,12 @@ No query parameters. Returns current ingest/aggregation status.
   `option_ohlc_1m.strike_price` — pass the exact strike as stored (e.g.
   `25000`, not `25000.0` vs `25000.00` formatting concerns; SQLite
   numeric comparison handles this fine).
+- Store the client key from `/register` securely and reuse it across app
+  launches — it is not retrievable again from the server if lost; the
+  only recovery path is an admin revoking and the user re-registering
+  under the same or a new username.
+- Treat `401 Unauthorized` from `/ohlc/*` as "not currently approved" and
+  route the user back through `/validate`'s status rather than assuming
+  the key itself is wrong — `pending` and `revoked` both surface as the
+  same 401 there, by design (see
+  [Authentication model](#authentication-model)).

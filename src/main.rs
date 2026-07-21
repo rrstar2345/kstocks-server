@@ -3,9 +3,10 @@ mod market;
 mod settings;
 mod stats;
 mod storage;
+mod users;
 mod utils;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -15,6 +16,7 @@ use market::{streamers, symbols};
 use settings::{load_or_create_config, setup_app_folders};
 use stats::new_shared_stats;
 use storage::{ohlc as aggregation, retention};
+use users::init_users_pool;
 use utils::dashboard;
 
 #[derive(Parser, Debug)]
@@ -24,6 +26,31 @@ struct Cli {
     /// scheduled/headless task, e.g. via systemd or cron).
     #[arg(long)]
     no_dashboard: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Admin-token management. Does not start the server/streamers — this
+    /// is a one-shot mode that only touches `kstocks-users.db`. Running it
+    /// requires shell access to the host, which is the intended access
+    /// control: the running server/admin API never has a code path that
+    /// can create or rotate its own admin token.
+    Admin {
+        #[command(subcommand)]
+        action: AdminAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AdminAction {
+    /// Generate a new admin token. Fails if one already exists — use
+    /// `regenerate` to rotate.
+    Generate,
+    /// Rotate the admin token, invalidating the previous one.
+    Regenerate,
 }
 
 #[tokio::main]
@@ -31,6 +58,34 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let paths = setup_app_folders()?;
+    let users_db_path = paths.db_dir.join("kstocks-users.db").to_string_lossy().to_string();
+
+    // `admin` subcommand: one-shot token management, no server startup.
+    if let Some(Command::Admin { action }) = &cli.command {
+        // Minimal logging to stderr only; this mode doesn't run long enough
+        // to need file logging, and shouldn't require the full app folder
+        // logging setup below.
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
+            .init();
+
+        match action {
+            AdminAction::Generate => {
+                let pool = users::init_users_pool(&users_db_path).await?;
+                if users::get_admin_token_hash(&pool).await?.is_some() {
+                    eprintln!(
+                        "An admin token already exists. Use `kstocks-server admin regenerate` to rotate it."
+                    );
+                    std::process::exit(1);
+                }
+                users::admin_cli::run_generate(&users_db_path).await?;
+            }
+            AdminAction::Regenerate => {
+                users::admin_cli::run_generate(&users_db_path).await?;
+            }
+        }
+        return Ok(());
+    }
 
     // File logging always on; when the dashboard takes over the terminal we
     // still want logs captured somewhere, so write to a log file under the
@@ -136,8 +191,22 @@ async fn main() -> anyhow::Result<()> {
     // weekly VACUUM.
     let retention_handle = retention::spawn_retention_loop(pool.clone(), config.retention.clone());
 
+    // Separate users DB (registrations, approval status, admin token hash).
+    // Opened here (not just in the `admin` subcommand) so the running
+    // server can serve /register, /validate, and /admin/* itself.
+    let users_pool = match init_users_pool(&users_db_path).await {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Failed to initialize users database: {}", e);
+            eprintln!("Failed to connect to users SQLite database: {e}");
+            return Err(e);
+        }
+    };
+    info!("Users database connected and schema verified");
+
     // Read-only HTTP OHLC API, on its own SqlitePool.
-    let api_handle = api::spawn_api_server(config.clone(), stats.clone(), session.clone());
+    let api_handle =
+        api::spawn_api_server(config.clone(), stats.clone(), session.clone(), users_pool);
 
     if cli.no_dashboard {
         info!("Running headless (--no-dashboard). Ctrl-C to stop.");
