@@ -200,7 +200,7 @@ pub async fn insert_registration(
     let res = sqlx::query(
         r#"
         INSERT INTO clients (username, key_id, secret_hash, status, registered_ip, created_at, updated_at)
-        VALUES (?, ?, 'pending', ?, ?, ?, ?)
+        VALUES (?, ?, ?, 'pending', ?, ?, ?)
         "#,
     )
     .bind(username)
