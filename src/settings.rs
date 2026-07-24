@@ -65,7 +65,7 @@ pub struct SystemConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DatabaseConfig {
-    /// Path to the SQLite database file, e.g. `<db_dir>/kstocks.db`.
+    /// Path to the SQLite database file, e.g. `<db_dir>/kstocks-server.db`.
     pub connection_string: String,
     pub max_connections: u32,
     /// Max ticks to buffer in memory before a forced flush.
@@ -158,7 +158,7 @@ impl ApiConfig {
 
 impl AppConfig {
     pub fn default(paths: &AppPaths) -> Self {
-        let db_path = paths.db_dir.join("kstocks.db");
+        let db_path = paths.db_dir.join("kstocks-server.db");
         AppConfig {
             system: SystemConfig {
                 indices_streamer: ApiEndpoint {
